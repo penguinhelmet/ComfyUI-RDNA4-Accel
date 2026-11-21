@@ -1,13 +1,13 @@
 [project]
-name = "comfyui-h3-r9700-accel"
-description = "Opt-in speed-ups for MiniMax H3 video and image in ComfyUI on the AMD Radeon AI PRO R9700 (gfx1201, ROCm): bf16 text encoder, bf16 VAE with Triton kernels, faster model swaps."
+name = "comfyui-rdna4-accel"
+description = "Opt-in speed-ups for ComfyUI on AMD RDNA4 (tested on the Radeon AI PRO R9700, gfx1201, ROCm): bf16 text encoders, bf16 VAE with Triton kernels, faster model swaps, lower-VRAM LTX VAE decode. MiniMax H3, Qwen-Image 2.1, Krea 2, MOSS Image, Z-Image, LTX-2.5."
 version = "0.1.0"
 license = { text = "MIT" }
 dependencies = []
 
 [project.urls]
-Repository = "https://github.com/penguinhelmet/ComfyUI-H3-R9700-Accel"
+Repository = "https://github.com/penguinhelmet/ComfyUI-RDNA4-Accel"
 
 [tool.comfy]
 PublisherId = "penguinhelmet"
-DisplayName = "ComfyUI-H3-R9700-Accel"
+DisplayName = "ComfyUI-RDNA4-Accel"

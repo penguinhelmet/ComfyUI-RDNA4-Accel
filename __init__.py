@@ -1,6 +1,6 @@
-"""MiniMax H3 speed-ups as opt-in nodes, leaving ComfyUI core files untouched.
+"""Speed-ups for ComfyUI on AMD RDNA4 (R9700, gfx1201) as opt-in nodes, leaving ComfyUI core files untouched.
 
-"MiniMax H3 Text Encoder BF16": put it after the CLIP loader. CLIPs that pass through it run the language model of
+"Text Encoder BF16" (class MiniMaxH3TextEncoderBF16, name kept so saved workflows still load): put it after the CLIP loader. CLIPs that pass through it run the language model of
 the MiniMax H3 text encoder (Qwen3-VL-32B) in bf16; every other CLIP is unchanged. ComfyUI's SDClipModel calls text
 encoders with dtype=float32, so the hidden states stay fp32 and each nvfp4 layer is dequantized to fp32 for an fp32
 GEMM. On ROCm (R9700) that lands on a small-tile fp32 kernel: ~32 s of a ~38 s encode. The weights file, the loader and
@@ -19,6 +19,7 @@ on, the attention layers of that VAE (and no other model) use rmsrope.py's Trito
 of comfy-kitchen's generic HIP kernel (~9x faster per call, closer to an fp32 reference). With fast_convrot_quant
 on, int8 GEMM inputs quantized while that VAE decodes go through convrot.py's Triton ConvRot quantizer (~3x faster).
 """
+import copy
 import threading
 import types
 
@@ -26,7 +27,7 @@ import torch
 import comfy.model_patcher
 import comfy.sd
 import comfy.text_encoders.qwen_vl
-from comfy.text_encoders import minimax, qwen35, qwen3vl
+from comfy.text_encoders import gemma4, llama, minimax, qwen35, qwen3vl
 
 OPTION = "h3accel_te_bf16"
 _state = threading.local()
@@ -68,7 +69,21 @@ def _img_forward(self, input_ids, attention_mask=None, embeds=None, *args, dtype
     return _img_forward_orig(self, input_ids, attention_mask, embeds, *args, dtype=dtype, **kwargs)
 
 
+_generate = comfy.sd.CLIP.generate
+
+
+def _gen(self, *args, **kwargs):
+    # TextGenerate (captioning, prompt enhancers): the image goes through the same fp32 vision tower
+    previous = getattr(_state, "bf16", False)
+    _state.bf16 = bool(self.patcher.model_options.get(OPTION, False))
+    try:
+        return _generate(self, *args, **kwargs)
+    finally:
+        _state.bf16 = previous
+
+
 comfy.sd.CLIP.encode_from_tokens = _encode
+comfy.sd.CLIP.generate = _gen
 minimax.MiniMaxQwen3VL.forward = _lm_forward
 minimax.PH3ImageQwen3VL.forward = _img_forward
 
@@ -130,6 +145,43 @@ def _q35_preprocess(self, embed, device):
 
 qwen35.Qwen35.forward = _q35_forward
 qwen35.Qwen35.preprocess_embed = _q35_preprocess
+
+# Qwen3 4B (Z-Image / Lumina 2): text only.
+_qwen3_4b_forward = llama.Qwen3_4B.forward
+
+
+def _q4b_forward(self, input_ids, *args, **kwargs):
+    if getattr(_state, "bf16", False) and kwargs.get("dtype") == torch.float32:
+        kwargs["dtype"] = torch.bfloat16
+        if kwargs.get("embeds") is not None:
+            kwargs["embeds"] = kwargs["embeds"].to(torch.bfloat16)
+        out = _qwen3_4b_forward(self, input_ids, *args, **kwargs)
+        if isinstance(out, tuple):
+            return tuple(o.float() if torch.is_tensor(o) and o.is_floating_point() else o for o in out)
+        return out.float() if torch.is_tensor(out) else out
+    return _qwen3_4b_forward(self, input_ids, *args, **kwargs)
+
+
+llama.Qwen3_4B.forward = _q4b_forward
+
+# Gemma 4 (LTX-2.5's gemma4-12b text encoder, prompts padded to 1024 tokens): text only. Gemma4Base inherits
+# BaseLlama.forward, so the wrapper goes on Gemma4Base and leaves the other BaseLlama models alone.
+_gemma4_forward = gemma4.Gemma4Base.forward
+
+
+def _g4_forward(self, input_ids, *args, **kwargs):
+    if getattr(_state, "bf16", False) and kwargs.get("dtype") == torch.float32:
+        kwargs["dtype"] = torch.bfloat16
+        if kwargs.get("embeds") is not None:
+            kwargs["embeds"] = kwargs["embeds"].to(torch.bfloat16)
+        out = _gemma4_forward(self, input_ids, *args, **kwargs)
+        if isinstance(out, tuple):
+            return tuple(o.float() if torch.is_tensor(o) and o.is_floating_point() else o for o in out)
+        return out.float() if torch.is_tensor(out) else out
+    return _gemma4_forward(self, input_ids, *args, **kwargs)
+
+
+gemma4.Gemma4Base.forward = _g4_forward
 
 NO_PIN = "h3accel_no_pin"
 _pin_weight_to_device = comfy.model_patcher.ModelPatcher.pin_weight_to_device
@@ -267,9 +319,79 @@ class UnpinnedOffload:
         return (model, clip)
 
 
+def _install_chunked_convs(model):
+    """Give every 3x3x3 conv inside a Lightricks CausalConv3d a forward that can run in temporal slices. Inert unless
+    _state.conv_chunk is set (only inside the decode of a VAE that went through the Chunked Conv3D node)."""
+    from comfy.ldm.lightricks.vae.causal_conv3d import CausalConv3d
+    count = 0
+    for m in model.modules():
+        if not isinstance(m, CausalConv3d):
+            continue
+        conv = m.conv
+        kt = conv.kernel_size[0]
+        if conv.stride[0] != 1 or conv.dilation[0] != 1 or conv.padding[0] != 0 or kt == 1:
+            continue
+        count += 1
+        if getattr(conv, "_h3accel_chunked", False):
+            continue
+        orig = conv.forward
+
+        def forward(x, orig=orig, kt=kt):
+            n = getattr(_state, "conv_chunk", 0)
+            t_out = x.shape[2] - kt + 1
+            if not n or t_out <= n:
+                return orig(x)
+            # output frames [i, i + n) only read input frames [i, i + n + kt - 1): same values, smaller workspace
+            return torch.cat([orig(x[:, :, i:i + n + kt - 1]) for i in range(0, t_out, n)], dim=2)
+
+        conv.forward = forward
+        conv._h3accel_chunked = True
+    return count
+
+
+class VAEChunkedConv3D:
+    DESCRIPTION = ("For LTX conv video VAEs (ltx-2.5-video-vae-conv). Without MIOpen, PyTorch runs each 3D convolution "
+                   "through a column buffer of 4-5 GB; the buffers of different sizes pile up in PyTorch's cache until "
+                   "the card is full, which can hang the AMD driver. This node runs each convolution a few frames at a "
+                   "time: same values, about a third of the VRAM, no slower. memory_factor scales ComfyUI's estimate of "
+                   "the VRAM the decode needs, which decides how much of the diffusion model is moved out first.")
+    CATEGORY = "advanced/model"
+    RETURN_TYPES = ("VAE",)
+    FUNCTION = "apply"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"vae": ("VAE",),
+                             "frames_per_chunk": ("INT", {"default": 4, "min": 0, "max": 64,
+                                                          "tooltip": "Output frames per convolution call. 0 = off."}),
+                             "memory_factor": ("FLOAT", {"default": 1.5, "min": 0.5, "max": 10.0, "step": 0.1})}}
+
+    def apply(self, vae, frames_per_chunk, memory_factor):
+        # shallow copy: the loader's VAE keeps its own estimate and methods; the model and patcher are shared
+        out = copy.copy(vae)
+        base = vae.memory_used_decode
+        out.memory_used_decode = lambda shape, dtype: base(shape, dtype) * memory_factor
+        if frames_per_chunk > 0 and _install_chunked_convs(vae.first_stage_model):
+            for name in ("decode", "decode_tiled"):
+                unbound = getattr(type(vae), name)
+
+                def run(*args, _unbound=unbound, **kwargs):
+                    previous = getattr(_state, "conv_chunk", 0)
+                    _state.conv_chunk = frames_per_chunk
+                    try:
+                        return _unbound(out, *args, **kwargs)
+                    finally:
+                        _state.conv_chunk = previous
+
+                setattr(out, name, run)
+        return (out,)
+
+
 NODE_CLASS_MAPPINGS = {"MiniMaxH3TextEncoderBF16": MiniMaxH3TextEncoderBF16,
                        "MiniMaxH3VAELoaderBF16": MiniMaxH3VAELoaderBF16,
-                       "H3UnpinnedOffload": UnpinnedOffload}
-NODE_DISPLAY_NAME_MAPPINGS = {"MiniMaxH3TextEncoderBF16": "MiniMax H3 Text Encoder BF16",
+                       "H3UnpinnedOffload": UnpinnedOffload,
+                       "H3VAEChunkedConv3D": VAEChunkedConv3D}
+NODE_DISPLAY_NAME_MAPPINGS = {"MiniMaxH3TextEncoderBF16": "Text Encoder BF16",
                               "MiniMaxH3VAELoaderBF16": "Load VAE (BF16)",
-                              "H3UnpinnedOffload": "Unpinned Offload (fast model swap)"}
+                              "H3UnpinnedOffload": "Unpinned Offload (fast model swap)",
+                              "H3VAEChunkedConv3D": "VAE Chunked Conv3D (LTX conv VAE)"}
