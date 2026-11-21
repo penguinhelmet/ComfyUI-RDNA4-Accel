@@ -11,8 +11,31 @@ Formerly *ComfyUI-H3-R9700-Accel*. Saved workflows keep working: the node IDs di
 |---|---|---|
 | [Text Encoder BF16](#text-encoder-bf16) | after **Load CLIP** | Runs Qwen3-VL / Qwen3.5 / Qwen3 4B / Gemma 4 text encoders (H3, Qwen-Image 2.1, Krea 2, MOSS Image, Z-Image, LTX-2.5) in bf16 instead of fp32 |
 | [Load VAE (BF16)](#load-vae-bf16) | replaces **Load VAE** for the final video decode | bf16 VAE plus two Triton kernels |
-| [Unpinned Offload (fast model swap)](#unpinned-offload-fast-model-swap) | on MODEL and CLIP (H3 Image) | Faster swaps between the text encoder and the image model |
+| [Unpinned Offload (fast model swap)](#unpinned-offload-fast-model-swap) | on MODEL and CLIP (H3 Image, LTX-2.5) | Faster swaps between the text encoder and the image model |
 | [VAE Chunked Conv3D (LTX conv VAE)](#vae-chunked-conv3d-ltx-conv-vae) | after **Load VAE** (LTX-2.5 conv video VAE) | Runs each 3D convolution a few frames at a time: a third of the VRAM, no driver hangs |
+
+<p>
+<img src="docs/nodes/text_encoder_bf16.png" alt="Text Encoder BF16 node" height="120">
+<img src="docs/nodes/load_vae_bf16.png" alt="Load VAE (BF16) node" height="120">
+<img src="docs/nodes/unpinned_offload.png" alt="Unpinned Offload node" height="120">
+<img src="docs/nodes/vae_chunked_conv3d.png" alt="VAE Chunked Conv3D node" height="120">
+</p>
+
+### Which node for which model
+
+| Model | Text Encoder BF16 | Load VAE (BF16) | Unpinned Offload | VAE Chunked Conv3D |
+|---|---|---|---|---|
+| MiniMax H3 video (T2V / I2V / R2V) | ✓ | ✓ final decode only | ✗ (see its section) | – |
+| MiniMax H3 Image (T2I / I2I) | ✓ | – | ✓ MODEL + CLIP | – |
+| Qwen-Image 2.1 (T2I, edit, ControlNet, TextGenerate captioners) | ✓ | – | – | – |
+| Krea 2 | ✓ | – | – | – |
+| MOSS Image | ✓ | – | – | – |
+| Z-Image (Lumina 2, e.g. REDZ) | ✓ | – | – | – |
+| LTX-2.5 I2V | ✓ (Gemma 4) | – | ✓ MODEL + CLIP | ✓ with the conv video VAE |
+| Wan 2.1 / SCAIL 2 | – (UMT5 is not covered) | – | – | – |
+
+✓ tested and measured on the R9700 · – no effect or not tested (the node passes the model through unchanged) ·
+✗ do not use.
 
 ## Results
 
@@ -58,6 +81,8 @@ the speed-up is not measured there.
 
 ## Text Encoder BF16
 
+<img src="docs/nodes/text_encoder_bf16.png" alt="Text Encoder BF16 node" width="400">
+
 Put it between **Load CLIP** (the `qwen3vl_32b_minimax_h3` text encoder) and everything that uses the CLIP.
 
 ComfyUI calls this text encoder with fp32 activations. Each nvfp4 layer is then dequantized to fp32 and runs as an
@@ -82,6 +107,8 @@ text connector.
 
 ## Load VAE (BF16)
 
+<img src="docs/nodes/load_vae_bf16.png" alt="Load VAE (BF16) node" width="400">
+
 A VAE loader for the **MiniMax H3 int8 video VAE** (`minimax_h3_video_vae_int8_convrot`). Wire it into the final
 **VAE Decode** only.
 
@@ -101,17 +128,24 @@ so changes there stay at the pixel level.
 
 ## Unpinned Offload (fast model swap)
 
-For **MiniMax H3 Image**. Put one node on the MODEL line (just before the guider / sampler) and the CLIP line.
+<img src="docs/nodes/unpinned_offload.png" alt="Unpinned Offload node" width="460">
+
+For **MiniMax H3 Image** and **LTX-2.5**. Put one node on the MODEL line (just before the guider / sampler) and the
+CLIP line.
 
 The text encoder (15 GB) and the H3 Image model (20 GB) do not fit in 32 GB together, so every prompt change moves
 part of each between VRAM and RAM. By default ComfyUI page-locks (pins) the weights it moves to RAM. For a swap this
 large, pinning costs more time than it saves. This node turns pinning off for the models passing through it.
 
 - **Output:** pixel-identical images.
+- LTX-2.5 (Gemma 4 12B text encoder 15 GB + 22B DiT 21.5 GB), 10 s clip, prompt change: 195 s → 175 s, with text
+  encode 17 s → 6 s.
 - Do **not** use it on the H3 *video* model. During stage-2 sampling that model is partly offloaded and streams its
   weights from pinned RAM.
 
 ## VAE Chunked Conv3D (LTX conv VAE)
+
+<img src="docs/nodes/vae_chunked_conv3d.png" alt="VAE Chunked Conv3D node" width="480">
 
 For the **LTX-2.5 conv video VAE** (`ltx-2.5-video-vae-conv-bf16`). Put it between **Load VAE** and **VAE Decode**
 (or **VAE Decode (Tiled)**).
