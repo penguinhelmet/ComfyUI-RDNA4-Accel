@@ -187,29 +187,50 @@ Load CLIP ────────────────────► Unpinn
 
 ## Example workflows
 
-Three ready-made workflows are in [`example_workflows/`](example_workflows). After install they also appear in
-ComfyUI under **Templates → ComfyUI-RDNA4-Accel**. Each has a note that lists its settings and measured times.
+Six ready-made workflows are in [`example_workflows/`](example_workflows). After install they also appear in
+ComfyUI under **Templates → ComfyUI-RDNA4-Accel**. Each has a note with its speed settings and measured times, and a
+note with model links and folders.
 
-| Workflow | What it is |
-|---|---|
-| `MiniMax_H3_Video_Latent-Upscale_R2V_Fast.json` | Reference-to-video, two-stage latent upscale (10 + 2 steps), with the text encoder and VAE nodes |
-| `MiniMax_H3_Image_T2I_Fast.json` | H3 Image text-to-image, 8 steps, with Unpinned Offload and the text encoder node |
-| `MiniMax_H3_Image_I2I_Fast.json` | H3 Image edit with up to five reference pictures, with Unpinned Offload and the text encoder node |
+| Workflow | What it is | Nodes from this repo |
+|---|---|---|
+| `MiniMax_H3_Video_Latent-Upscale_R2V.json` | H3 reference-to-video, two-stage latent upscale (10 + 2 steps) | Text Encoder BF16, Load VAE (BF16) |
+| `MiniMax_H3_Image_T2I.json` | H3 Image text-to-image, 8 steps | Text Encoder BF16, Unpinned Offload |
+| `MiniMax_H3_Image_I2I.json` | H3 Image edit with up to five reference pictures | Text Encoder BF16, Unpinned Offload |
+| `Qwen_image_2_1_T2I.json` | Qwen-Image 2.1 turbo text-to-image, optional tiled Enhance Detail pass | Text Encoder BF16 |
+| `Qwen_image_2_1_I2I.json` | Qwen-Image 2.1 edit (head / body swap with reference pictures), optional Enhance Detail | Text Encoder BF16 |
+| `LTX-2.5_I2V.json` | LTX-2.5 image-to-video with audio, two stages (half size, x2 latent upscale, full size) | Text Encoder BF16, Unpinned Offload, VAE Chunked Conv3D |
 
 They keep the model file names they were tested with (for example a fine-tuned H3 video checkpoint and LoRAs). Pick
-your own files in the loader nodes. They also use other node packs:
+your own files in the loader nodes.
+
+The LTX-2.5 workflow loads the official distilled int8 model with int8 attention switched on. Make that file once
+with the script in [`tools/`](tools):
+
+```sh
+python tools/add_int8_attention.py \
+  ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors \
+  ltx-2.5-22b-distilled-transformer-comfy-int8-convrot-int8attn.safetensors \
+  --attention 'transformer_blocks\.\d+\.attn1$'
+```
+
+Or pick the official file in **Load Diffusion Model**. It works, but stage 2 is slower.
+
+The workflows also use other node packs:
 
 | Pack | Used by |
 |---|---|
-| [ComfyUI-Pixaroma](https://github.com/pixaroma/ComfyUI-Pixaroma) | all three (prompt, sizes, timer, save) |
-| [ComfyUI-KJNodes](https://github.com/kijai/ComfyUI-KJNodes) | video, I2I |
-| [rgthree-comfy](https://github.com/rgthree/rgthree-comfy) | video, I2I |
-| [Comfyui_Minimax_h3_latent_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler) | video |
-| [ComfyUI-VideoHelperSuite](https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite), [ComfyUI-Easy-Use](https://github.com/yolain/ComfyUI-Easy-Use), [ComfyUI_UniBlockSwap](https://github.com/smthemex/ComfyUI_UniBlockSwap) | video |
-| [H3-Video-LoRA-Loader-for-Image](https://github.com/DeepNeuralNerd/H3-Video-LoRA-Loader-for-Image) | T2I |
-| [ComfyUI-Penguinhelmet](https://github.com/penguinhelmet/ComfyUI-Penguinhelmet) | I2I (image picker) |
+| [ComfyUI-Pixaroma](https://github.com/pixaroma/ComfyUI-Pixaroma) | H3 (prompt, sizes, timer, save), Qwen (image loader, sizes) |
+| [ComfyUI-KJNodes](https://github.com/kijai/ComfyUI-KJNodes) | H3 video, H3 I2I, Qwen I2I |
+| [rgthree-comfy](https://github.com/rgthree/rgthree-comfy) | H3 video, H3 I2I, Qwen T2I, Qwen I2I |
+| [ComfyUI-AusBoss](https://github.com/ausboss/ComfyUI-AusBoss) | Qwen T2I, Qwen I2I (tiled Enhance Detail) |
+| [RES4LYF](https://github.com/ClownsharkBatwing/RES4LYF) | Qwen I2I |
+| [ComfyUI-Easy-Use](https://github.com/yolain/ComfyUI-Easy-Use) | H3 video, Qwen T2I |
+| [Comfyui_Minimax_h3_latent_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler), [ComfyUI-VideoHelperSuite](https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite), [ComfyUI_UniBlockSwap](https://github.com/smthemex/ComfyUI_UniBlockSwap) | H3 video |
+| [H3-Video-LoRA-Loader-for-Image](https://github.com/DeepNeuralNerd/H3-Video-LoRA-Loader-for-Image) | H3 T2I |
+| [ComfyUI-Penguinhelmet](https://github.com/penguinhelmet/ComfyUI-Penguinhelmet) | H3 I2I (image picker) |
 
-ComfyUI Manager's *Install Missing Custom Nodes* finds most of them.
+The LTX-2.5 workflow uses only core nodes and this repo. ComfyUI Manager's *Install Missing Custom Nodes* finds most
+of the others.
 
 ## If something breaks
 
