@@ -12,7 +12,7 @@ Formerly *ComfyUI-H3-R9700-Accel*. Saved workflows keep working: the node IDs di
 | [Text Encoder BF16](#text-encoder-bf16) | after **Load CLIP** | Runs Qwen3-VL / Qwen3.5 / Qwen3 4B / Gemma 4 text encoders (H3, Qwen-Image 2.1, Krea 2, MOSS Image, Z-Image, LTX-2.5) in bf16 instead of fp32 |
 | [Load VAE (BF16)](#load-vae-bf16) | replaces **Load VAE** for the final video decode | bf16 VAE plus two Triton kernels |
 | [Unpinned Offload (fast model swap)](#unpinned-offload-fast-model-swap) | on MODEL and CLIP (H3 Image, LTX-2.5) | Faster swaps between the text encoder and the image model |
-| [VAE Chunked Conv3D (LTX conv VAE)](#vae-chunked-conv3d-ltx-conv-vae) | after **Load VAE** (LTX-2.5 conv video VAE) | Runs each 3D convolution a few frames at a time: a third of the VRAM, no driver hangs |
+| [VAE Chunked Conv3D (LTX / H3 VAE)](#vae-chunked-conv3d-ltx--h3-vae) | after **Load VAE** (LTX-2.5 conv video VAE, MiniMax H3 video VAE) | Runs each 3D convolution a few frames at a time: a third of the VRAM, no driver hangs, no 7 GB buffers in H3 reference-video encodes |
 
 <p>
 <img src="docs/nodes/text_encoder_bf16.png" alt="Text Encoder BF16 node" height="120">
@@ -25,7 +25,7 @@ Formerly *ComfyUI-H3-R9700-Accel*. Saved workflows keep working: the node IDs di
 
 | Model | Text Encoder BF16 | Load VAE (BF16) | Unpinned Offload | VAE Chunked Conv3D |
 |---|---|---|---|---|
-| MiniMax H3 video (T2V / I2V / R2V) | ✓ | ✓ final decode only | ✗ (see its section) | – |
+| MiniMax H3 video (T2V / I2V / R2V) | ✓ | ✓ final decode only | ✗ (see its section) | ✓ when a reference video is encoded (character swap) |
 | MiniMax H3 Image (T2I / I2I) | ✓ | – | ✓ MODEL + CLIP | – |
 | Qwen-Image 2.1 (T2I, edit, ControlNet, TextGenerate captioners) | ✓ | – | – | – |
 | Krea 2 | ✓ | – | – | – |
@@ -143,7 +143,7 @@ large, pinning costs more time than it saves. This node turns pinning off for th
 - Do **not** use it on the H3 *video* model. During stage-2 sampling that model is partly offloaded and streams its
   weights from pinned RAM.
 
-## VAE Chunked Conv3D (LTX conv VAE)
+## VAE Chunked Conv3D (LTX / H3 VAE)
 
 <img src="docs/nodes/vae_chunked_conv3d.png" alt="VAE Chunked Conv3D node" width="480">
 
@@ -165,6 +165,19 @@ convolution on a few output frames at a time.
 - A tested setup for 10 s clips: Chunked Conv3D (4, 2.5) → **VAE Decode (Tiled)** with tile 1280, overlap 64,
   temporal 64, temporal overlap 16. Temporal tiles below 32/16 show visible changes at every block start.
 - Only the conv VAE has these convolutions. The default LTX-2.5 video VAE (with attention) passes through unchanged.
+- **MiniMax H3 video VAE** (encode and decode): encoding a reference video at the stage-2 size of a character-swap
+  workflow asked for one 7.17 GiB column buffer and ran out of VRAM next to the loaded model. Through this node
+  (4, 1.5) it fits, and two swap runs back to back pass. The memory factor also scales ComfyUI's encode estimate.
+
+## Fixes applied on load
+
+Loading the pack also patches one thing that has no node:
+
+- **pi-H3 DWD on AMD** ([ComfyUI-piFlow](https://github.com/Lakonik/ComfyUI-piFlow)): the H3 VAE's Sol decoder builds
+  its `norm_out` without weight casting. pi-H3's DWD head reuses that decoder with fp16 weights on bf16 features and
+  stops with `expected scalar type BFloat16 but found Half`. The patch casts those weights to the input; for the VAE
+  itself the dtypes already match and nothing changes. With it, pi-H3 DWD (2 steps, 1344×768, 5 s) takes 47 s warm
+  on the R9700.
 
 ---
 
@@ -199,6 +212,9 @@ note with model links and folders.
 | `Qwen_image_2_1_T2I.json` | Qwen-Image 2.1 turbo text-to-image, optional tiled Enhance Detail pass | Text Encoder BF16 |
 | `Qwen_image_2_1_I2I.json` | Qwen-Image 2.1 edit (head / body swap with reference pictures), optional Enhance Detail | Text Encoder BF16 |
 | `LTX-2.5_I2V.json` | LTX-2.5 image-to-video with audio, two stages (half size, x2 latent upscale, full size) | Text Encoder BF16, Unpinned Offload, VAE Chunked Conv3D |
+| `MiniMax_H3_Character-Swap_R2V.json` | H3 character swap: SAM3 masks the person in a source video, two stages (3D latent upscale). A 5 s 720p swap in about 6 min with 50 GB RAM; notes on face identity | Text Encoder BF16, Load VAE (BF16), VAE Chunked Conv3D |
+| `MiniMax_H3_Video_First-Last-Frame_Latent-Upscale.json` | H3 first + last frame to video (fl2va + 8-step turbo), two stages; bypass Last Frame for first frame only. 5 s to 768×1376 in 124 s warm | Text Encoder BF16, Load VAE (BF16) |
+| `MiniMax_H3_pi-H3_DWD_2-4-step.json` | pi-H3 DWD: H3 video in 2 or 4 steps without a VAE decode. 1344×768, 5 s: 47 s warm | Text Encoder BF16 (and the DWD fix above) |
 
 They keep the model file names they were tested with (for example a fine-tuned H3 video checkpoint and LoRAs). Pick
 your own files in the loader nodes.
@@ -220,14 +236,15 @@ The workflows also use other node packs:
 | Pack | Used by |
 |---|---|
 | [ComfyUI-Pixaroma](https://github.com/pixaroma/ComfyUI-Pixaroma) | H3 (prompt, sizes, timer, save), Qwen (image loader, sizes) |
-| [ComfyUI-KJNodes](https://github.com/kijai/ComfyUI-KJNodes) | H3 video, H3 I2I, Qwen I2I |
+| [ComfyUI-KJNodes](https://github.com/kijai/ComfyUI-KJNodes) | H3 video, H3 swap (low-VRAM attention, chunked feed-forward, VRAM_Debug), H3 I2I, Qwen I2I |
 | [rgthree-comfy](https://github.com/rgthree/rgthree-comfy) | H3 video, H3 I2I, Qwen T2I, Qwen I2I |
 | [ComfyUI-AusBoss](https://github.com/ausboss/ComfyUI-AusBoss) | Qwen T2I, Qwen I2I (tiled Enhance Detail) |
 | [RES4LYF](https://github.com/ClownsharkBatwing/RES4LYF) | Qwen I2I |
 | [ComfyUI-Easy-Use](https://github.com/yolain/ComfyUI-Easy-Use) | H3 video, Qwen T2I |
-| [Comfyui_Minimax_h3_latent_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler), [ComfyUI-VideoHelperSuite](https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite), [ComfyUI_UniBlockSwap](https://github.com/smthemex/ComfyUI_UniBlockSwap) | H3 video |
+| [Comfyui_Minimax_h3_latent_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler), [ComfyUI-VideoHelperSuite](https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite), [ComfyUI_UniBlockSwap](https://github.com/smthemex/ComfyUI_UniBlockSwap) | H3 video (VideoHelperSuite also H3 swap) |
 | [H3-Video-LoRA-Loader-for-Image](https://github.com/DeepNeuralNerd/H3-Video-LoRA-Loader-for-Image) | H3 T2I |
-| [ComfyUI-Penguinhelmet](https://github.com/penguinhelmet/ComfyUI-Penguinhelmet) | H3 I2I (image picker) |
+| [ComfyUI-Penguinhelmet](https://github.com/penguinhelmet/ComfyUI-Penguinhelmet) | H3 I2I (image picker), H3 first + last frame (Clear Keyframe Guides, Add Guide optional image) |
+| [ComfyUI-piFlow](https://github.com/Lakonik/ComfyUI-piFlow) | pi-H3 DWD (adapters: [Lakonik/pi-H3](https://huggingface.co/Lakonik/pi-H3)) |
 
 The LTX-2.5 workflow uses only core nodes and this repo. ComfyUI Manager's *Install Missing Custom Nodes* finds most
 of the others.

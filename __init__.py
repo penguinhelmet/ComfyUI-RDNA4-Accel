@@ -346,15 +346,47 @@ def _install_chunked_convs(model):
 
         conv.forward = forward
         conv._h3accel_chunked = True
+    return count + _install_chunked_h3_convs(model)
+
+
+def _install_chunked_h3_convs(model):
+    """Same for the MiniMax H3 video VAE: its CausalConv3d pads first and then calls the plain conv, so the temporal
+    slicing goes on _conv_forward (stride 1 in time, no temporal padding left inside the conv)."""
+    try:
+        from comfy.ldm.minimax.vae import CausalConv3d as H3CausalConv3d
+    except ImportError:
+        return 0
+    count = 0
+    for conv in model.modules():
+        if not isinstance(conv, H3CausalConv3d):
+            continue
+        kt = conv.kernel_size[0]
+        if conv.stride[0] != 1 or conv.dilation[0] != 1 or conv.padding[0] != 0 or kt == 1:
+            continue
+        count += 1
+        if getattr(conv, "_h3accel_chunked", False):
+            continue
+        orig = conv._conv_forward
+
+        def conv_forward(x, weight, bias, *args, orig=orig, kt=kt, **kwargs):
+            n = getattr(_state, "conv_chunk", 0)
+            t_out = x.shape[2] - kt + 1
+            if not n or t_out <= n or args or kwargs.get("autopad"):
+                return orig(x, weight, bias, *args, **kwargs)
+            return torch.cat([orig(x[:, :, i:i + n + kt - 1], weight, bias, **kwargs) for i in range(0, t_out, n)], dim=2)
+
+        conv._conv_forward = conv_forward
+        conv._h3accel_chunked = True
     return count
 
 
 class VAEChunkedConv3D:
-    DESCRIPTION = ("For LTX conv video VAEs (ltx-2.5-video-vae-conv). Without MIOpen, PyTorch runs each 3D convolution "
+    DESCRIPTION = ("For the LTX conv video VAE (ltx-2.5-video-vae-conv) and the MiniMax H3 video VAE (encode and "
+                   "decode). Without MIOpen, PyTorch runs each 3D convolution "
                    "through a column buffer of 4-5 GB; the buffers of different sizes pile up in PyTorch's cache until "
                    "the card is full, which can hang the AMD driver. This node runs each convolution a few frames at a "
                    "time: same values, about a third of the VRAM, no slower. memory_factor scales ComfyUI's estimate of "
-                   "the VRAM the decode needs, which decides how much of the diffusion model is moved out first.")
+                   "the VRAM the encode / decode needs, which decides how much of the diffusion model is moved out first.")
     CATEGORY = "advanced/model"
     RETURN_TYPES = ("VAE",)
     FUNCTION = "apply"
@@ -371,9 +403,13 @@ class VAEChunkedConv3D:
         out = copy.copy(vae)
         base = vae.memory_used_decode
         out.memory_used_decode = lambda shape, dtype: base(shape, dtype) * memory_factor
+        base_enc = vae.memory_used_encode
+        out.memory_used_encode = lambda shape, dtype: base_enc(shape, dtype) * memory_factor
         if frames_per_chunk > 0 and _install_chunked_convs(vae.first_stage_model):
-            for name in ("decode", "decode_tiled"):
-                unbound = getattr(type(vae), name)
+            for name in ("decode", "decode_tiled", "encode", "encode_tiled"):
+                unbound = getattr(type(vae), name, None)
+                if unbound is None:
+                    continue
 
                 def run(*args, _unbound=unbound, **kwargs):
                     previous = getattr(_state, "conv_chunk", 0)
@@ -387,6 +423,31 @@ class VAEChunkedConv3D:
         return (out,)
 
 
+def _patch_h3_decoder_norm_out():
+    """The Sol (ViT) decoder of the H3 VAE builds norm_out with plain ops, so it never casts its weights. pi-H3's DWD
+    head (ComfyUI-piFlow) reuses that decoder with fp16 weights on bf16 DiT features, and the layer norm fails with
+    "expected scalar type BFloat16 but found Half". Casting the weights to the input fixes it; for the VAE itself the
+    dtypes already match and the cast does nothing."""
+    try:
+        from comfy.ldm.minimax.vae import NonCausalViT3DDecoder
+    except ImportError:
+        return
+    if getattr(NonCausalViT3DDecoder, "_h3accel_norm_cast", False):
+        return
+    orig = NonCausalViT3DDecoder.__init__
+
+    def __init__(self, *args, **kwargs):
+        orig(self, *args, **kwargs)
+        norm = getattr(self, "norm_out", None)
+        if norm is not None and hasattr(norm, "comfy_cast_weights"):
+            norm.comfy_cast_weights = True
+
+    NonCausalViT3DDecoder.__init__ = __init__
+    NonCausalViT3DDecoder._h3accel_norm_cast = True
+
+
+_patch_h3_decoder_norm_out()
+
 NODE_CLASS_MAPPINGS = {"MiniMaxH3TextEncoderBF16": MiniMaxH3TextEncoderBF16,
                        "MiniMaxH3VAELoaderBF16": MiniMaxH3VAELoaderBF16,
                        "H3UnpinnedOffload": UnpinnedOffload,
@@ -394,4 +455,4 @@ NODE_CLASS_MAPPINGS = {"MiniMaxH3TextEncoderBF16": MiniMaxH3TextEncoderBF16,
 NODE_DISPLAY_NAME_MAPPINGS = {"MiniMaxH3TextEncoderBF16": "Text Encoder BF16",
                               "MiniMaxH3VAELoaderBF16": "Load VAE (BF16)",
                               "H3UnpinnedOffload": "Unpinned Offload (fast model swap)",
-                              "H3VAEChunkedConv3D": "VAE Chunked Conv3D (LTX conv VAE)"}
+                              "H3VAEChunkedConv3D": "VAE Chunked Conv3D (LTX / H3 VAE)"}
